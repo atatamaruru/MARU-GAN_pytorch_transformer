@@ -7,6 +7,9 @@ import math
 import time
 import pandas as pd
 import numpy as np
+import os
+from datetime import datetime
+
 import torch
 import torch.utils.data as data
 import torch.nn as nn
@@ -16,7 +19,11 @@ import torch.optim as optim
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import accuracy_score
 
-from make_dataset import _col_names, GAN_Img_Dataset, get_valid, get_test
+import sys
+sys.path.append('../')
+import make_dataset
+
+from make_dataset import _col_names, GAN_Img_Dataset, get_train, get_valid, get_test
 from anomaly_score_transformer import Anomaly_score
 
 # Setup seeds
@@ -27,66 +34,24 @@ random.seed(1234)
 
 #PositionalEncoderの実装
 
-'''
-class PositionalEncoder(nn.Module):
-    #入力された単語の位置を示すベクトル情報を付加する
-
-    def __init__(self, d_model=512, max_seq_len=12):
-        super().__init__()
-
-        self.d_model = d_model  # 単語ベクトルの次元数
-
-        # 単語の順番（pos）と埋め込みベクトルの次元の位置（i）によって一意に定まる値の表をpeとして作成
-        pe = torch.zeros(max_seq_len, d_model)
-
-        # GPUが使える場合はGPUへ送る、ここでは省略。実際に学習時には使用する
-        # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        # pe = pe.to(device)
-
-        for pos in range(max_seq_len):
-            for i in range(0, d_model, 2):
-                pe[pos, i] = math.sin(pos / (10000 ** ((2 * i)/d_model)))
-
-                # 誤植修正_200510 #79
-                # pe[pos, i + 1] = math.cos(pos /
-                #                          (10000 ** ((2 * (i + 1))/d_model)))
-                pe[pos, i + 1] = math.cos(pos /
-                                          (10000 ** ((2 * i)/d_model)))
-
-        # 表peの先頭に、ミニバッチ次元となる次元を足す
-        self.pe = pe.unsqueeze(0)
-
-        # 勾配を計算しないようにする
-        self.pe.requires_grad = False
-
-    def forward(self, x):
-
-        # 入力xとPositonal Encodingを足し算する
-        # xがpeよりも小さいので、大きくする
-        #print(x.size())
-        #print(self.pe.size())
-        #print(x.device)
-        #print(self.pe.device)
-        ret = math.sqrt(self.d_model)*x + self.pe.to(device='cuda:1')
-        
-        return ret
-'''
 
 class PositionalEncoding(nn.Module):
- 
-    def __init__(self, d_model, seq_len=12):
+
+    def __init__(self, d_model, seq_len):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=0.1)
- 
+
         pe = torch.zeros(seq_len, d_model)
+        #print('pe', pe.shape)
         position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
+        #print('position', position.shape)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        #print('div_term', div_term.shape)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0).transpose(0, 1)
-        #print('pe', pe.size())
         self.register_buffer('pe', pe)
- 
+
     def forward(self, x):
         x = x + self.pe[:x.size(0), :]
         return self.dropout(x)
@@ -96,26 +61,31 @@ class PositionalEncoding(nn.Module):
 
 class Generator(nn.Module):
 
-    def __init__(self, d_model):
+    def __init__(self, d_model, seq_len, nhead, dim_feedforward, dropout, num_layers):
         super(Generator, self).__init__()
 
-        self.inp = torch.nn.Parameter(torch.randn(12, 51))
+        self.inp = torch.nn.Parameter(torch.randn(seq_len, 51))
         self.inp.requires_grad = True
         
         # memoryの処理(実データを使わないときに使用)
-        self.z_layer = nn.Linear(512, 512*12)       
+        self.z_layer = nn.Linear(d_model, d_model*seq_len)
+        self.z_norm = nn.LayerNorm(d_model) # Transformer-Encoderの処理に合わせる       
  
         # 時系列データの入力処理
         self.embedding_layer = nn.Linear(51, d_model)
        
         # Positional Encodeingの処理
-        self.positionalencoding_layer = PositionalEncoding(d_model, seq_len=12) 
+        self.positionalencoding_layer = PositionalEncoding(d_model, seq_len) 
         
+        # Dropoutの処理
+        self.dropout_layer = nn.Dropout(p=dropout) 
+
         # Transformer decoder側の処理 default dim_feedforward =2048
-        self.decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=8)
-     
+        self.decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout)
+        self.transformer_decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=num_layers)
+    
         #時系列データの出力処理
-        self.output_layer = nn.Linear(512, 51)   
+        self.output_layer = nn.Linear(d_model, 51)   
 
     def forward(self, z, flag_real):
 
@@ -123,7 +93,9 @@ class Generator(nn.Module):
         #print('z', z.size())
         # 実データを使わない場合
         if flag_real == False:
-            memory = self.z_layer(z).view(12, z.size()[0], 512)
+            memory = self.z_layer(z)
+            memory = memory.view(z.size()[0], seq_len, d_model).permute(1, 0, 2)
+            memory = self.z_norm(memory)
         # 実データを使う場合
         else:
             memory = z
@@ -139,7 +111,8 @@ class Generator(nn.Module):
         x2 = self.embedding_layer(inp)
         x3 = self.positionalencoding_layer(x2)
         #print('x3', x3.size())
-        out = self.decoder_layer(x3, memory) 
+        #out = self.decoder_layer(x3, memory) 
+        out = self.transformer_decoder(x3, memory)
         #print('out', out.size())
         out = self.output_layer(out)
         #print('out', out.size())
@@ -154,13 +127,13 @@ class Discriminator(nn.Module):
         super(Discriminator, self).__init__()
 
         # 時系列データ側の入力処理
-        self.x_layer = nn.GRU(x_dim, 100, dropout=0.2)
+        self.x_layer = nn.GRU(x_dim, 100)
 
-        # 潜在変数側の入力処理
-        # 実データを使う場合
-        self.z_layer_real = nn.Linear(12*d_model, 100)
-        # 実データを使わない場合    
-        self.z_layer_fake = nn.Linear(d_model, 100)        
+        # 潜在変数側の入力処理 
+        self.z_layer = nn.Sequential(
+            nn.Linear(d_model, 100),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Dropout(p=0.2))        
  
         # 最後の判定
         self.last1 = nn.Sequential( 
@@ -170,7 +143,7 @@ class Discriminator(nn.Module):
 
         self.last2 = nn.Linear(100, 1)
 
-    def forward(self, x, z, flag_real):
+    def forward(self, x, z):
 
         #print('Dis')
         # 時系列データ側の処理
@@ -180,16 +153,9 @@ class Discriminator(nn.Module):
         #print('x_out', x_out.size())
 
         # 潜在変数側の処理
-        batch_size = z.size()[1]
-        if flag_real:
-            z = z.permute(1, 0, 2).contiguous().view(batch_size, -1)
-            z = self.z_layer_real(z)
-        
-        if flag_real == False:        
-            z = self.z_layer_fake(z)
-
+        #print('z', z.size())
+        z = self.z_layer(z)
         #print('z', z.size()) 
-
 
         # z_outとx_outを結合し、全結合層で判定
         out = torch.cat([x_out, z], dim=1)
@@ -212,17 +178,24 @@ class Discriminator(nn.Module):
 
 class Encoder(nn.Module):
 
-    def __init__(self, d_model):
+    def __init__(self, d_model, seq_len, nhead, dim_feedforward, dropout, num_layers):
         super(Encoder, self).__init__()
 
         # 時系列データの入力処理
         self.embedding_layer = nn.Linear(51, d_model)
 
         # Positional Encodeingの処理
-        self.positionalencoding_layer = PositionalEncoding(d_model, seq_len=12)
-
+        self.positionalencoding_layer = PositionalEncoding(d_model, seq_len)
+        
+        # Dropoutの処理
+        self.dropout_layer = nn.Dropout(p=dropout)
+        
         # Transformer decoder側の処理 default dim_feedforward =2048
-        self.encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8)
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout)
+        self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers)
+
+        # Discriminatorへの入力用
+        self.linear_layer_dis = nn.Linear(seq_len*d_model, d_model) 
 
     def forward(self, x):
               
@@ -230,56 +203,34 @@ class Encoder(nn.Module):
         #print('inp', x.size())
         x2 = self.embedding_layer(x)
         x3 = self.positionalencoding_layer(x2)
-        out = self.encoder_layer(x3)
-        #print('out', out.size())        
+        x4 = self.dropout_layer(x3)
+        #out = self.encoder_layer(x4)
+        out = self.transformer_encoder(x4)
+        #print('out', out.size())
 
-        return out
+        # Discriminatorへの入力用
+        mini_batch_size = out.size()[1]
+        out2 = out.view(mini_batch_size, -1)
+        #print('out2', out2.size())
+        out2 = self.linear_layer_dis(out2)
+        #print('out2', out2.size())        
 
-
-# Datasetを作成
-seq_len = 12
-
-train_file_path = '/home/maru/data/SWaT/shuffle_train_12_0.2_12.csv'
-train_df_dataset = pd.read_csv(train_file_path, delimiter=',', names=_col_names())
-train_df_dataset = train_df_dataset.replace({'Is_Attack': {'Normal':0}})
-train_nmp_dataset, train_nmp_labels = np.array(train_df_dataset.iloc[1:,1:52].astype(np.float32)), np.array(train_df_dataset.iloc[1:,52:53].astype(np.float32))
-train_dataset = GAN_Img_Dataset(torch.tensor(train_nmp_dataset), torch.tensor(train_nmp_labels), seq_len)
-
-valid_dataset = get_valid(seq_len)
-test_dataset = get_test(seq_len)
-
-
-# DataLoaderを作成
-batch_size = 64
-
-train_dataloader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True)
-valid_dataloader = torch.utils.data.DataLoader(
-            valid_dataset, batch_size=batch_size, shuffle=False)
-
-# 動作の確認
-#batch_iterator = iter(train_dataloader)  # イテレータに変換
-#timeseries, labels = next(batch_iterator)  # 1番目の要素を取り出す
-#print(timeseries.size())  # torch.Size([batch_size, seq_len, dim])
-#print(labels.size()) # torch.Size([batch_size])
-
-#batch_iterator = iter(valid_dataloader)  # イテレータに変換
-#timeseries, labels = next(batch_iterator)  # 1番目の要素を取り出す
-#print(timeseries)
-#print(labels)
+        return out, out2
 
 
 # モデルを学習させる関数を作成
 
-def train_model(G, D, E, train_dataloader, valid_dataloader, num_epochs):
+def train_model(G, D, E, train_dataloader, valid_dataloader, num_epochs, d_model, file_dir):
 
     # GPUが使えるかを確認
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     #print("使用デバイス：", device)
 
     # 最適化手法の設定
     lr_ge = 0.0001
-    lr_d = 0.0001/4
+    lr_d = 0.0001 / 4
+    print('learning rate of generator and encoder: {}'.format(lr_ge))
+    print('learning rate of discriminator: {}'.format(lr_d))
     beta1, beta2 = 0.5, 0.999
     g_optimizer = torch.optim.Adam(G.parameters(), lr_ge, [beta1, beta2])
     e_optimizer = torch.optim.Adam(E.parameters(), lr_ge, [beta1, beta2])
@@ -292,7 +243,6 @@ def train_model(G, D, E, train_dataloader, valid_dataloader, num_epochs):
 
     # パラメータをハードコーディング
     z_dim = 100
-    seq_len = 12
 
     # ネットワークをGPUへ
     G.to(device)
@@ -354,15 +304,15 @@ def train_model(G, D, E, train_dataloader, valid_dataloader, num_epochs):
             # 真の画像を判定
             timeseries = timeseries.permute(1, 0, 2).to(device)
             #print(timeseries.size())
-            z_out_real = E(timeseries)
+            _, z_out_real = E(timeseries)
             #print(z_out_real.size())
-            d_out_real, _ = D(timeseries, z_out_real, flag_real=True)
+            d_out_real, _ = D(timeseries, z_out_real)
 
             # 偽の画像を生成して判定
-            input_z = torch.randn(mini_batch_size, 512).to(device)       
+            input_z = torch.randn(mini_batch_size, d_model).to(device)       
             fake_images = G(input_z, flag_real=False)
             #print(fake_images.size())
-            d_out_fake, _ = D(fake_images, input_z, flag_real=False)
+            d_out_fake, _ = D(fake_images, input_z)
 
             # 誤差を計算
             d_loss_real = criterion(d_out_real.view(-1), label_real)
@@ -379,9 +329,9 @@ def train_model(G, D, E, train_dataloader, valid_dataloader, num_epochs):
             # 2. Generatorの学習
             # --------------------
             # 偽の画像を生成して判定
-            input_z = torch.randn(mini_batch_size, 512).to(device)
+            input_z = torch.randn(mini_batch_size, d_model).to(device)
             fake_images = G(input_z, flag_real=False)
-            d_out_fake, _ = D(fake_images, input_z, flag_real=False)
+            d_out_fake, _ = D(fake_images, input_z)
 
             # 誤差を計算
             g_loss = criterion(d_out_fake.view(-1), label_real)
@@ -395,9 +345,9 @@ def train_model(G, D, E, train_dataloader, valid_dataloader, num_epochs):
             # 3. Encoderの学習
             # --------------------
             # 真の画像のzを推定
-            z_out_real = E(timeseries)
+            _, z_out_real = E(timeseries)
             #print(z_out_real.size())
-            d_out_real, _ = D(timeseries, z_out_real, flag_real=True)
+            d_out_real, _ = D(timeseries, z_out_real)
 
             # 誤差を計算
             e_loss = criterion(d_out_real.view(-1), label_fake)
@@ -444,7 +394,7 @@ def train_model(G, D, E, train_dataloader, valid_dataloader, num_epochs):
             #print(mini_batch_size)
             # 異常検知したいデータをエンコードしてzにしてから、Gで生成
             timeseries = timeseries.permute(1, 0, 2).to(device)
-            z_out_real = E(timeseries)
+            z_out_real, z_out_real_2 = E(timeseries)
             #print(z_out_real.size())
             imges_reconstract = G(z_out_real, flag_real=True)
             #print('timeseries', timeseries.size())
@@ -452,7 +402,7 @@ def train_model(G, D, E, train_dataloader, valid_dataloader, num_epochs):
 
             # 損失を求める
             loss, loss_each, residual_loss_each = Anomaly_score(
-                timeseries, imges_reconstract, z_out_real, D, Lambda=0.1)
+                timeseries, imges_reconstract, z_out_real_2, D, Lambda=0.1)
 
             # 損失の計算。トータルの損失
             loss_each = loss_each.cpu().detach().numpy()
@@ -478,9 +428,9 @@ def train_model(G, D, E, train_dataloader, valid_dataloader, num_epochs):
 
         # PyTorchのネットワークのパラメータの保存
         if epoch == 0 or f1 >= best_f1:
-            torch.save(G.state_dict(), './weights/transformer/G_weights_tf.pth')
-            torch.save(D.state_dict(), './weights/transformer/D_weights_tf.pth')
-            torch.save(E.state_dict(), './weights/transformer/E_weights_tf.pth')
+            torch.save(G.state_dict(), '{}G_weights_tf.pth'.format(file_dir))
+            torch.save(D.state_dict(), '{}D_weights_tf.pth'.format(file_dir))
+            torch.save(E.state_dict(), '{}E_weights_tf.pth'.format(file_dir))
             best_f1 = f1
             best_epoch = epoch
         print('best epoch: ', best_epoch)
@@ -508,9 +458,54 @@ def weights_init(m):
         # 全結合層Linearの初期化
         m.bias.data.fill_(0)
 
-G = Generator(d_model=512)
-E = Encoder(d_model=512)
-D = Discriminator(x_dim=51, d_model=512)
+
+# 事前設定
+d_model = 512 # default=512
+seq_len = 24 # default=12
+nhead = 8 # default=8
+dim_feedforward  = 2048 # default=2048
+dropout = 0.1 # default=0.1
+num_layers = 6 # default=6
+batch_size = 64
+
+print('d_model: {}'.format(d_model))
+print('seq_len: {}'.format(seq_len))
+print('nhead: {}'.format(nhead))
+print('dim_feedforward: {}'.format(dim_feedforward))
+print('dropout: {}'.format(dropout))
+print('num_layers: {}'.format(num_layers))
+print('batch_size: {}'.format(batch_size))
+
+# Datasetを生成
+train_dataset = get_train('/Storage/maru/SWaT/shuffle_train_{0}_0.2_{0}.csv'.format(seq_len), seq_len)
+valid_dataset = get_valid('/Storage/maru/SWaT/shuffle_valid_{0}_0.2_{0}.csv'.format(seq_len), seq_len)
+test_dataset = get_test('/Storage/maru/SWaT/shuffle_test_{0}_0.2_{0}.csv'.format(seq_len), seq_len)
+'''
+train_dataset = get_train('/home/maru/data/SWaT/shuffle_train_window{0}_shift{0}_0.2_{0}.csv'.format(seq_len), seq_len)
+valid_dataset = get_valid('/home/maru/data/SWaT/shuffle_valid_window{0}_shift{0}_0.2_{0}.csv'.format(seq_len), seq_len)
+test_dataset = get_test('/home/maru/data/SWaT/shuffle_test_window{0}_shift{0}_0.2_{0}.csv'.format(seq_len), seq_len)
+'''
+
+# DataLoaderを作成
+train_dataloader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=False)
+valid_dataloader = torch.utils.data.DataLoader(
+            valid_dataset, batch_size=batch_size, shuffle=False)
+
+# 動作の確認
+#batch_iterator = iter(train_dataloader)  # イテレータに変換
+#timeseries, labels = next(batch_iterator)  # 1番目の要素を取り出す
+#print(timeseries.size())  # torch.Size([batch_size, seq_len, dim])
+#print(labels.size()) # torch.Size([batch_size])
+
+#batch_iterator = iter(valid_dataloader)  # イテレータに変換
+#timeseries, labels = next(batch_iterator)  # 1番目の要素を取り出す
+#print(timeseries)
+#print(labels)
+
+G = Generator(d_model, seq_len, nhead, dim_feedforward, dropout, num_layers)
+E = Encoder(d_model, seq_len, nhead, dim_feedforward, dropout, num_layers)
+D = Discriminator(x_dim=51, d_model=d_model)
 
 # 初期化の実施
 G.apply(weights_init)
@@ -520,27 +515,32 @@ D.apply(weights_init)
 print("ネットワークの初期化完了")
 
 
+today = datetime.now().strftime("%Y%m%d")
+file_dir = './weights/v1/{0}/{1}/'.format(seq_len, today)
+if not os.path.exists(file_dir):
+    os.makedirs(file_dir)
+
+
 # 学習・検証を実行する
-num_epochs = 10000
+num_epochs = 2
 train_model(
-G, D, E, train_dataloader=train_dataloader, valid_dataloader=valid_dataloader, num_epochs=num_epochs)
+G, D, E, train_dataloader=train_dataloader, valid_dataloader=valid_dataloader, num_epochs=num_epochs, d_model=d_model, file_dir=file_dir)
 
 
 # DataLoaderを作成
-batch_size = 64
-
 test_dataloader = torch.utils.data.DataLoader(
     test_dataset, batch_size=batch_size, shuffle=False)
 
 
 #def test_model(G_update, D_update, E_update, test_dataloader):
  
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 
 # PyTorchのネットワークパラメータのロード
-G_load_weights = torch.load('./weights/transformer/G_weights_tf.pth')
-D_load_weights = torch.load('./weights/transformer/D_weights_tf.pth')
-E_load_weights = torch.load('./weights/transformer/E_weights_tf.pth')
+G_load_weights = torch.load('{}G_weights_tf.pth'.format(file_dir))
+D_load_weights = torch.load('{}D_weights_tf.pth'.format(file_dir))
+E_load_weights = torch.load('{}E_weights_tf.pth'.format(file_dir))
 G.load_state_dict(G_load_weights)
 D.load_state_dict(D_load_weights)
 E.load_state_dict(E_load_weights)
@@ -563,7 +563,7 @@ for timeseries, labels in test_dataloader:
     # 異常検知したいデータをエンコードしてzにしてから、Gで生成
     mini_batch_size = timeseries.size()[0]
     timeseries = timeseries.permute(1, 0, 2).to(device)
-    z_out_real = E(timeseries)
+    z_out_real, z_out_real_2 = E(timeseries)
     #z_out_real = z_out_real.permute(1, 0, 2)
     #z_out_real = z_out_real.reshape(-1, 300).to(device)
     #print('z_out_real', z_out_real.size())
@@ -574,7 +574,7 @@ for timeseries, labels in test_dataloader:
 
     # 損失を求める
     loss, loss_each, residual_loss_each = Anomaly_score(
-        timeseries, imges_reconstract, z_out_real, D, Lambda=0.1)
+        timeseries, imges_reconstract, z_out_real_2, D, Lambda=0.1)
 
     # 損失の計算。トータルの損失
     loss_each = loss_each.cpu().detach().numpy()
